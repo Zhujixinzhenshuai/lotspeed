@@ -162,6 +162,8 @@ MODULE_PARM_DESC(lotserver_verbose, "Enable verbose logging");
 static atomic_t active_connections = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
 static atomic_t total_losses = ATOMIC_INIT(0);
+static atomic_t module_ref_count = ATOMIC_INIT(0);
+
 
 struct lotspeed {
     u64 target_rate;
@@ -205,6 +207,8 @@ static void lotspeed_init(struct sock *sk)
 #endif
 
     atomic_inc(&active_connections);
+    atomic_inc(&module_ref_count);
+
 
     if (lotserver_verbose) {
         unsigned long gbps_int = ca->target_rate / 125000000;
@@ -227,6 +231,7 @@ static void lotspeed_release(struct sock *sk)
     u64 duration = ktime_get_real_seconds() - ca->start_time;
 
     atomic_dec(&active_connections);
+    atomic_dec(&module_ref_count);
     atomic64_add(ca->bytes_sent, &total_bytes_sent);
     atomic_add(ca->loss_count, &total_losses);
 
@@ -499,6 +504,7 @@ static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
         .ssthresh       = lotspeed_ssthresh,
         .undo_cwnd      = lotspeed_undo_cwnd,
         .cwnd_event     = lotspeed_cwnd_event,
+        .flags          = TCP_CONG_NON_RESTRICTED,
 };
 
 // 添加这个辅助函数来格式化带边框的行
@@ -560,18 +566,42 @@ static void __exit lotspeed_module_exit(void)
 {
     u64 total_bytes;
     u64 gb_sent, mb_sent;
+    int active_conns;
 
+    // 先切换默认算法到 cubic
+    pr_info("lotspeed: Switching default algorithm to cubic...\n");
+
+    // 注销拥塞控制算法
     tcp_unregister_congestion_control(&lotspeed_ops);
 
-    total_bytes = atomic64_read(&total_bytes_sent);
-    gb_sent = total_bytes >> 30;  // 转换为 GB (2^30)
-    mb_sent = (total_bytes >> 20) & 0x3FF;  // 余下的 MB
+    // 等待所有连接释放
+    active_conns = atomic_read(&active_connections);
+    if (active_conns > 0) {
+        pr_warn("lotspeed: Warning - %d active connections still exist\n", active_conns);
+        pr_warn("lotspeed: Please close all connections using lotspeed\n");
+    }
 
-    pr_info("LotSpeed v2.0 unloaded | Stats: connections=%d, sent=%llu.%llu GB, losses=%d\n",
-            atomic_read(&active_connections),
-            gb_sent, mb_sent * 1000 / 1024,  // 近似小数部分
-            atomic_read(&total_losses));
+    // 检查引用计数
+    if (atomic_read(&module_ref_count) > 0) {
+        pr_warn("lotspeed: Warning - module ref count is %d\n",
+                atomic_read(&module_ref_count));
+    }
+
+    total_bytes = atomic64_read(&total_bytes_sent);
+    gb_sent = total_bytes >> 30;
+    mb_sent = (total_bytes >> 20) & 0x3FF;
+
+    pr_info("╔════════════════════════════════════════════════════════╗\n");
+    pr_info("║          LotSpeed v2.0 Unloaded Successfully           ║\n");
+    print_boxed_line("          Active Connections: ",
+                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%d", active_conns); buf;}));
+    print_boxed_line("          Total Data Sent: ",
+                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%llu.%llu GB", gb_sent, mb_sent * 1000 / 1024); buf;}));
+    print_boxed_line("          Total Losses: ",
+                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%d", atomic_read(&total_losses)); buf;}));
+    pr_info("╚════════════════════════════════════════════════════════╝\n");
 }
+
 
 module_init(lotspeed_module_init);
 module_exit(lotspeed_module_exit);
