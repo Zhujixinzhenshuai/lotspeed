@@ -591,8 +591,8 @@ case "$ACTION" in
         ;;
     *)
         echo "╔════════════════════════════════════════════════════════╗"
-        echo "║          LotSpeed v2.0 Management Tool                  ║"
-        echo "║          Created by uk0 @ 2025-11-18                    ║"
+        echo "║          LotSpeed v2.0 Management Tool                 ║"
+        echo "║          Created by uk0 @ 2025-11-18                   ║"
         echo "╚════════════════════════════════════════════════════════╝"
         echo ""
         echo "Usage: lotspeed {command} [options]"
