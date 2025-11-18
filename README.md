@@ -5,9 +5,11 @@
 
 ```bash
 
-# 编译
+# 下载代码/编译
 
-make
+git clone https://github.com/uk0/lotspeed.git 
+
+cd lotspeed && make
 
 # 加载模块
 sudo insmod lotspeed.ko
