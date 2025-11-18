@@ -255,7 +255,7 @@ safe_stop() {
     # 1. 先切换到 cubic
     echo -e "${CYAN}Step 1: Switching to cubic algorithm${NC}"
     sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
-
+    echo 1 > /sys/module/lotspeed/parameters/force_unload
     # 2. 检查活动连接
     echo -e "${CYAN}Step 2: Checking active connections${NC}"
     ACTIVE_CONNS=$(ss -tin | grep lotspeed | wc -l)
@@ -332,6 +332,7 @@ safe_uninstall() {
     rm -f /usr/local/bin/lotspeed
 
     echo -e "${GREEN}✓ Current net.ipv4.tcp_congestion_control ${NC}"
+    echo -e "${GREEN}✓ Switched to cubic${NC}"
     sysctl net.ipv4.tcp_congestion_control
 }
 

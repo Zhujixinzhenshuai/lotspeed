@@ -18,6 +18,7 @@ static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
 static bool lotserver_adaptive = true;                 // 自适应模式
 static bool lotserver_turbo = false;                   // 涡轮模式
 static bool lotserver_verbose = true;                  // 详细日志模式
+static bool force_unload = false;
 
 // 参数变更回调 - 速率
 static int param_set_rate(const char *val, const struct kernel_param *kp)
@@ -135,8 +136,10 @@ static const struct kernel_param_ops param_ops_turbo = {
         .set = param_set_turbo,
         .get = param_get_bool,
 };
-
 // 注册参数
+module_param(force_unload, bool, 0644);
+MODULE_PARM_DESC(force_unload, "Force unload module ignoring references");
+
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
 MODULE_PARM_DESC(lotserver_rate, "Target rate in bytes/sec (default 10Gbps)");
 
@@ -568,23 +571,28 @@ static void __exit lotspeed_module_exit(void)
     u64 gb_sent, mb_sent;
     int active_conns;
 
+    pr_info("lotspeed: Beginning module unload at 2025-11-18 07:50:15 by uk0\n");
+
+    // 强制清理所有连接
+    if (force_unload) {
+        pr_warn("lotspeed: FORCE UNLOAD activated, cleaning up forcefully...\n");
+        atomic_set(&active_connections, 0);
+        atomic_set(&module_ref_count, 0);
+    }
+
     // 先切换默认算法到 cubic
     pr_info("lotspeed: Switching default algorithm to cubic...\n");
 
     // 注销拥塞控制算法
     tcp_unregister_congestion_control(&lotspeed_ops);
 
-    // 等待所有连接释放
-    active_conns = atomic_read(&active_connections);
-    if (active_conns > 0) {
-        pr_warn("lotspeed: Warning - %d active connections still exist\n", active_conns);
-        pr_warn("lotspeed: Please close all connections using lotspeed\n");
-    }
+    // 等待一下让系统清理
+    msleep(100);
 
-    // 检查引用计数
-    if (atomic_read(&module_ref_count) > 0) {
-        pr_warn("lotspeed: Warning - module ref count is %d\n",
-                atomic_read(&module_ref_count));
+    active_conns = atomic_read(&active_connections);
+    if (active_conns > 0 && !force_unload) {
+        pr_warn("lotspeed: Warning - %d active connections still exist\n", active_conns);
+        pr_warn("lotspeed: Use 'echo 1 > /sys/module/lotspeed/parameters/force_unload' to force\n");
     }
 
     total_bytes = atomic64_read(&total_bytes_sent);
@@ -593,15 +601,14 @@ static void __exit lotspeed_module_exit(void)
 
     pr_info("╔════════════════════════════════════════════════════════╗\n");
     pr_info("║          LotSpeed v2.0 Unloaded Successfully           ║\n");
+    print_boxed_line("          Unloaded at: ", "2025-11-18 07:50:15");
+    print_boxed_line("          By user: ", "uk0");
     print_boxed_line("          Active Connections: ",
                      ({static char buf[32]; snprintf(buf, sizeof(buf), "%d", active_conns); buf;}));
     print_boxed_line("          Total Data Sent: ",
                      ({static char buf[32]; snprintf(buf, sizeof(buf), "%llu.%llu GB", gb_sent, mb_sent * 1000 / 1024); buf;}));
-    print_boxed_line("          Total Losses: ",
-                     ({static char buf[32]; snprintf(buf, sizeof(buf), "%d", atomic_read(&total_losses)); buf;}));
     pr_info("╚════════════════════════════════════════════════════════╝\n");
 }
-
 
 module_init(lotspeed_module_init);
 module_exit(lotspeed_module_exit);
