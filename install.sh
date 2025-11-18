@@ -618,9 +618,8 @@ case "$ACTION" in
         echo "Examples:"
         echo "  lotspeed status"
         echo "  lotspeed preset balanced"
-        echo "  lotspeed set lotserver_rate 1000000000"
-        echo "  lotspeed set lotserver_turbo 1"
-        echo "  lotspeed set lotserver_verbose 0"
+        echo "  lotspeed set lotserver_turbo 1 #无视网络环境尽可能的发包"
+        echo "  lotspeed set lotserver_verbose 0 #关闭日志"
         echo "  lotspeed monitor"
         exit 1
         ;;
