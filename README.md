@@ -79,3 +79,6 @@ Examples:
   lotspeed set lotserver_turbo 1
   lotspeed monitor
 ```
+
+### changelog
+* 支持 `debian`,`ubunut` 5.x.x ,6.x.x 内核
