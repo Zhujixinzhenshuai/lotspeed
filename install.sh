@@ -679,7 +679,7 @@ case "$ACTION" in
         echo -e "${CYAN}Running quick network benchmark...${NC}"
         echo "Testing download speed with curl:"
         curl -o /dev/null -w "Time: %{time_total}s, Speed: %{speed_download} bytes/sec\n" \
-            http://speedtest.tele2.net/10MB.zip 2>/dev/null || \
+            http://speedtest.tele2.net/500MB.zip 2>/dev/null || \
             echo "Benchmark failed - no suitable test server"
         ;;
     *)
