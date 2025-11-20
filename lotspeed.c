@@ -1,6 +1,6 @@
-// lotspeed_opt.c  ——  2025 年的"锐速"复活版 v3.0 (高性能优化版)
-// Optimized by AI Assistant based on uk0's v2.0
-// 核心改进：移除高频日志锁、增加动态带宽探测(BWE)、优化 Pacing 起搏系数
+// lotspeed.c  ——  2025 年的"锐速"复活版 v2.0
+// Author: uk0 @ 2025-11-19 17:06:58
+// 致敬经典 LotServer/ServerSpeeder，为新时代而生
 
 #include <linux/module.h>
 #include <linux/version.h>
@@ -10,106 +10,213 @@
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 
-// ============================================================
-// 版本兼容性宏定义
-// ============================================================
+// 版本兼容性检测 - 修正版本判断逻辑
+// 根据实际测试：6.8.0 使用旧API，6.17+ 使用新API
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6,17,0)
 #define KERNEL_6_17_PLUS 1
     #define NEW_CONG_CONTROL_API 1
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(6,9,0) && LINUX_VERSION_CODE < KERNEL_VERSION(6,17,0)
-#define NEW_CONG_CONTROL_API 1
+// 6.9 - 6.16 使用新API (需要进一步测试确认)
+    #define NEW_CONG_CONTROL_API 1
 #elif LINUX_VERSION_CODE >= KERNEL_VERSION(5,19,0) && LINUX_VERSION_CODE < KERNEL_VERSION(6,8,0)
-#define NEW_CONG_CONTROL_API 1
+// 5.19 - 6.7.x 使用新API
+    #define NEW_CONG_CONTROL_API 1
 #else
+// 6.8.0 - 6.8.x 以及更早版本使用旧API
 #define OLD_CONG_CONTROL_API 1
 #endif
 
-// ============================================================
-// 可调参数
-// ============================================================
-static unsigned long lotserver_rate = 0;               // 0 = 自动探测模式 (推荐)
+// 可调参数（通过 sysfs 动态修改）
+static unsigned long lotserver_rate = 125000000ULL;  // 默认 1Gbps
 static unsigned int lotserver_gain = 30;               // 3.0x 默认增益
-static unsigned int lotserver_min_cwnd = 40;           // 最小拥塞窗口
-static unsigned int lotserver_max_cwnd = 20000;        // 最大拥塞窗口 (调大以适应大带宽)
+static unsigned int lotserver_min_cwnd = 50;           // 最小拥塞窗口
+static unsigned int lotserver_max_cwnd = 10000;        // 最大拥塞窗口
+static bool lotserver_adaptive = true;                 // 自适应模式
 static bool lotserver_turbo = false;                   // 涡轮模式
-static bool lotserver_verbose = false;                  // 仅控制连接开关的日志，不影响性能
+static bool lotserver_verbose = true;                  // 详细日志模式
 static bool force_unload = false;
 
-// 参数回调函数 (保留基本功能)
-static int param_set_rate(const char *val, const struct kernel_param *kp) {
-    return param_set_ulong(val, kp);
-}
-static int param_set_gain(const char *val, const struct kernel_param *kp) {
-    return param_set_uint(val, kp);
-}
-static int param_set_min_cwnd(const char *val, const struct kernel_param *kp) {
-    return param_set_uint(val, kp);
-}
-static int param_set_max_cwnd(const char *val, const struct kernel_param *kp) {
-    return param_set_uint(val, kp);
-}
-static int param_set_turbo(const char *val, const struct kernel_param *kp) {
-    bool old = lotserver_turbo;
-    int ret = param_set_bool(val, kp);
-    if (ret == 0 && old != lotserver_turbo && lotserver_verbose) {
-        pr_info("lotspeed: Turbo Mode %s\n", lotserver_turbo ? "ACTIVATED" : "DEACTIVATED");
+// 参数变更回调 - 速率
+static int param_set_rate(const char *val, const struct kernel_param *kp)
+{
+    unsigned long old_val = lotserver_rate;
+    int ret = param_set_ulong(val, kp);
+
+    if (ret == 0 && old_val != lotserver_rate && lotserver_verbose) {
+        unsigned long gbps_int = lotserver_rate / 125000000;
+        unsigned long gbps_frac = (lotserver_rate % 125000000) * 100 / 125000000;
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] rate changed: %lu -> %lu (%lu.%02lu Gbps)\n",
+                old_val, lotserver_rate, gbps_int, gbps_frac);
     }
     return ret;
 }
 
-static const struct kernel_param_ops param_ops_rate = { .set = param_set_rate, .get = param_get_ulong };
-static const struct kernel_param_ops param_ops_gain = { .set = param_set_gain, .get = param_get_uint };
-static const struct kernel_param_ops param_ops_min_cwnd = { .set = param_set_min_cwnd, .get = param_get_uint };
-static const struct kernel_param_ops param_ops_max_cwnd = { .set = param_set_max_cwnd, .get = param_get_uint };
-static const struct kernel_param_ops param_ops_turbo = { .set = param_set_turbo, .get = param_get_bool };
+// 参数变更回调 - 增益
+static int param_set_gain(const char *val, const struct kernel_param *kp)
+{
+    unsigned int old_val = lotserver_gain;
+    int ret = param_set_uint(val, kp);
+
+    if (ret == 0 && old_val != lotserver_gain && lotserver_verbose) {
+        unsigned int gain_int = lotserver_gain / 10;
+        unsigned int gain_frac = lotserver_gain % 10;
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] gain changed: %u -> %u (%u.%ux)\n",
+                old_val, lotserver_gain, gain_int, gain_frac);
+    }
+    return ret;
+}
+
+// 参数变更回调 - 最小窗口
+static int param_set_min_cwnd(const char *val, const struct kernel_param *kp)
+{
+    unsigned int old_val = lotserver_min_cwnd;
+    int ret = param_set_uint(val, kp);
+
+    if (ret == 0 && old_val != lotserver_min_cwnd && lotserver_verbose) {
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] min_cwnd changed: %u -> %u\n",
+                old_val, lotserver_min_cwnd);
+    }
+    return ret;
+}
+
+// 参数变更回调 - 最大窗口
+static int param_set_max_cwnd(const char *val, const struct kernel_param *kp)
+{
+    unsigned int old_val = lotserver_max_cwnd;
+    int ret = param_set_uint(val, kp);
+
+    if (ret == 0 && old_val != lotserver_max_cwnd && lotserver_verbose) {
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] max_cwnd changed: %u -> %u\n",
+                old_val, lotserver_max_cwnd);
+    }
+    return ret;
+}
+
+// 参数变更回调 - 自适应模式
+static int param_set_adaptive(const char *val, const struct kernel_param *kp)
+{
+    bool old_val = lotserver_adaptive;
+    int ret = param_set_bool(val, kp);
+
+    if (ret == 0 && old_val != lotserver_adaptive && lotserver_verbose) {
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] adaptive mode: %s -> %s\n",
+                old_val ? "ON" : "OFF", lotserver_adaptive ? "ON" : "OFF");
+    }
+    return ret;
+}
+
+// 参数变更回调 - 涡轮模式
+static int param_set_turbo(const char *val, const struct kernel_param *kp)
+{
+    bool old_val = lotserver_turbo;
+    int ret = param_set_bool(val, kp);
+
+    if (ret == 0 && old_val != lotserver_turbo && lotserver_verbose) {
+        if (lotserver_turbo) {
+            pr_info("lotspeed: [uk0@2025-11-19 17:06:58] ⚡⚡⚡ TURBO MODE ACTIVATED ⚡⚡⚡\n");
+            pr_info("lotspeed: WARNING: Ignoring ALL congestion signals!\n");
+        } else {
+            pr_info("lotspeed: [uk0@2025-11-19 17:06:58] Turbo mode DEACTIVATED\n");
+        }
+    }
+    return ret;
+}
+
+// 自定义参数操作
+static const struct kernel_param_ops param_ops_rate = {
+        .set = param_set_rate,
+        .get = param_get_ulong,
+};
+
+static const struct kernel_param_ops param_ops_gain = {
+        .set = param_set_gain,
+        .get = param_get_uint,
+};
+
+static const struct kernel_param_ops param_ops_min_cwnd = {
+        .set = param_set_min_cwnd,
+        .get = param_get_uint,
+};
+
+static const struct kernel_param_ops param_ops_max_cwnd = {
+        .set = param_set_max_cwnd,
+        .get = param_get_uint,
+};
+
+static const struct kernel_param_ops param_ops_adaptive = {
+        .set = param_set_adaptive,
+        .get = param_get_bool,
+};
+
+static const struct kernel_param_ops param_ops_turbo = {
+        .set = param_set_turbo,
+        .get = param_get_bool,
+};
+
+// 注册参数
+module_param(force_unload, bool, 0644);
+MODULE_PARM_DESC(force_unload, "Force unload module ignoring references");
 
 module_param_cb(lotserver_rate, &param_ops_rate, &lotserver_rate, 0644);
-MODULE_PARM_DESC(lotserver_rate, "Min target rate (0=Auto, >0=Static Floor)");
+MODULE_PARM_DESC(lotserver_rate, "Target rate in bytes/sec (default 1Gbps)");
+
 module_param_cb(lotserver_gain, &param_ops_gain, &lotserver_gain, 0644);
 MODULE_PARM_DESC(lotserver_gain, "Gain multiplier x10 (30 = 3.0x)");
-module_param_cb(lotserver_min_cwnd, &param_ops_min_cwnd, &lotserver_min_cwnd, 0644);
-module_param_cb(lotserver_max_cwnd, &param_ops_max_cwnd, &lotserver_max_cwnd, 0644);
-module_param_cb(lotserver_turbo, &param_ops_turbo, &lotserver_turbo, 0644);
-module_param(lotserver_verbose, bool, 0644);
-module_param(force_unload, bool, 0644);
 
-// ============================================================
-// 数据结构与统计
-// ============================================================
+module_param_cb(lotserver_min_cwnd, &param_ops_min_cwnd, &lotserver_min_cwnd, 0644);
+MODULE_PARM_DESC(lotserver_min_cwnd, "Minimum congestion window");
+
+module_param_cb(lotserver_max_cwnd, &param_ops_max_cwnd, &lotserver_max_cwnd, 0644);
+MODULE_PARM_DESC(lotserver_max_cwnd, "Maximum congestion window");
+
+module_param_cb(lotserver_adaptive, &param_ops_adaptive, &lotserver_adaptive, 0644);
+MODULE_PARM_DESC(lotserver_adaptive, "Enable adaptive rate control");
+
+module_param_cb(lotserver_turbo, &param_ops_turbo, &lotserver_turbo, 0644);
+MODULE_PARM_DESC(lotserver_turbo, "Turbo mode - ignore all congestion signals");
+
+module_param(lotserver_verbose, bool, 0644);
+MODULE_PARM_DESC(lotserver_verbose, "Enable verbose logging");
+
+// 统计信息
 static atomic_t active_connections = ATOMIC_INIT(0);
 static atomic64_t total_bytes_sent = ATOMIC64_INIT(0);
 static atomic_t total_losses = ATOMIC_INIT(0);
+static atomic_t module_ref_count = ATOMIC_INIT(0);
 
 struct lotspeed {
-    u64 max_bw;         // 观测到的最大带宽 (Bandwidth Estimation)
-    u64 current_bw;     // 当前采样带宽
+    u64 target_rate;
+    u64 actual_rate;
     u32 cwnd_gain;
     u32 loss_count;
     u32 rtt_min;
-    u64 bytes_sent;
-    u64 start_time;
-    bool ss_mode;       // 慢启动标记
+    u32 rtt_cnt;
+    u64 last_update;
+    bool ss_mode;
+    u32 probe_cnt;
+    u64 bytes_sent;     // 添加字节统计
+    u64 start_time;     // 连接开始时间
 };
 
 static struct tcp_congestion_ops lotspeed_ops;
 
-// ============================================================
-// 核心逻辑
-// ============================================================
-
+// 初始化连接
 static void lotspeed_init(struct sock *sk)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct lotspeed *ca = inet_csk_ca(sk);
 
-    tp->snd_ssthresh = TCP_INFINITE_SSTHRESH; // 起步即最高速
-
-    ca->max_bw = lotserver_rate > 0 ? lotserver_rate : 12500000; // 默认最小 100Mbps 起步
-    ca->current_bw = 0;
+    // 初始化状态
+    tp->snd_ssthresh = lotserver_turbo ? TCP_INFINITE_SSTHRESH : tp->snd_cwnd * 2;
+    ca->target_rate = lotserver_rate;
+    ca->actual_rate = 0;
     ca->cwnd_gain = lotserver_gain;
     ca->loss_count = 0;
     ca->rtt_min = 0;
+    ca->rtt_cnt = 0;
+    ca->last_update = tcp_jiffies32;
     ca->ss_mode = true;
+    ca->probe_cnt = 0;
     ca->bytes_sent = 0;
     ca->start_time = ktime_get_real_seconds();
 
@@ -119,202 +226,337 @@ static void lotspeed_init(struct sock *sk)
 #endif
 
     atomic_inc(&active_connections);
+    atomic_inc(&module_ref_count);
 
     if (lotserver_verbose) {
-        pr_info("lotspeed: [+CONN] Active: %d | Init BW: %llu | Gain: %u.%u\n",
-                atomic_read(&active_connections), ca->max_bw, ca->cwnd_gain/10, ca->cwnd_gain%10);
+        unsigned long gbps_int = ca->target_rate / 125000000;
+        unsigned long gbps_frac = (ca->target_rate % 125000000) * 100 / 125000000;
+        unsigned int gain_int = ca->cwnd_gain / 10;
+        unsigned int gain_frac = ca->cwnd_gain % 10;
+
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] NEW connection #%d | rate=%lu.%02lu Gbps | gain=%u.%ux | mode=%s\n",
+                atomic_read(&active_connections),
+                gbps_int, gbps_frac,
+                gain_int, gain_frac,
+                lotserver_turbo ? "TURBO" : (lotserver_adaptive ? "adaptive" : "fixed"));
     }
 }
 
+// 释放连接
 static void lotspeed_release(struct sock *sk)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
+    u64 duration;
 
+    // 添加空指针检查
     if (!ca) {
+        pr_warn("lotspeed: [uk0@2025-11-19 17:06:58] release called with NULL ca\n");
         atomic_dec(&active_connections);
         return;
     }
 
+    // 安全获取 duration
+    if (ca->start_time > 0) {
+        duration = ktime_get_real_seconds() - ca->start_time;
+    } else {
+        duration = 0;
+    }
+
     atomic_dec(&active_connections);
-    if (ca->bytes_sent > 0) atomic64_add(ca->bytes_sent, &total_bytes_sent);
-    if (ca->loss_count > 0) atomic_add(ca->loss_count, &total_losses);
+
+    // 只有在有数据时才更新统计
+    if (ca->bytes_sent > 0) {
+        atomic64_add(ca->bytes_sent, &total_bytes_sent);
+    }
+    if (ca->loss_count > 0) {
+        atomic_add(ca->loss_count, &total_losses);
+    }
 
     if (lotserver_verbose) {
-        pr_info("lotspeed: [-CONN] Active: %d | MaxBW: %llu Bps | Losses: %u\n",
-                atomic_read(&active_connections), ca->max_bw, ca->loss_count);
+        pr_info("lotspeed: [uk0@2025-11-19 17:06:58] connection released, active=%d\n",
+                atomic_read(&active_connections));
     }
+
+    // 清理 ca 结构
     memset(ca, 0, sizeof(struct lotspeed));
 }
 
-// 更新最小 RTT
-static inline void lotspeed_update_rtt(struct sock *sk, struct lotspeed *ca)
+// 更新 RTT 统计
+static void lotspeed_update_rtt(struct sock *sk)
 {
+    struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
     u32 rtt_us = tp->srtt_us >> 3;
 
-    if (rtt_us > 0 && (ca->rtt_min == 0 || rtt_us < ca->rtt_min)) {
+    if (!rtt_us || rtt_us == 0)
+        return;
+
+    // 记录最小 RTT 作为基准
+    if (!ca->rtt_min || rtt_us < ca->rtt_min) {
         ca->rtt_min = rtt_us;
+        if (lotserver_verbose && ca->rtt_cnt > 100) {
+            pr_debug("lotspeed: new min RTT: %u us\n", ca->rtt_min);
+        }
     }
+
+    ca->rtt_cnt++;
 }
 
-// 核心：带宽探测与速率计算
-// 这是性能优化的关键：基于真实采样数据，而不是猜测
-static void lotspeed_update_bandwidth(struct sock *sk, const struct rate_sample *rs)
+// 自适应速率调整
+static void lotspeed_adapt_rate(struct sock *sk, const struct rate_sample *rs)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
     u64 bw = 0;
 
-    if (!rs || rs->delivered <= 0 || rs->interval_us <= 0)
+    if (!lotserver_adaptive)
         return;
 
-    // 计算采样带宽 (Bytes/sec)
-    bw = (u64)rs->delivered * USEC_PER_SEC;
-    do_div(bw, rs->interval_us);
+    // 计算实际带宽
+    if (rs && rs->delivered > 0 && rs->interval_us > 0) {
+        bw = (u64)rs->delivered * USEC_PER_SEC;
+        do_div(bw, rs->interval_us);
+        ca->actual_rate = bw;
 
-    ca->current_bw = bw;
-    ca->bytes_sent += rs->delivered * tp->mss_cache;
+        // 更新发送字节数
+        ca->bytes_sent += rs->delivered * tp->mss_cache;
 
-    // 峰值带宽保持 (Peak Hold)
-    // 锐速逻辑：相信曾经达到的最大速度，除非长期无法达到
-    if (bw > ca->max_bw) {
-        ca->max_bw = bw;
-    } else {
-        // 缓慢衰减 max_bw，防止一次错误的尖峰导致永久虚高
-        // 每收到一次采样，如果低于 max，衰减极小比例 (0.1%)
-        // 这样既激进，又能在网络变差时慢慢回归
-        u64 decay = ca->max_bw >> 10;
-        if (ca->max_bw > decay) ca->max_bw -= decay;
+        // 如果实际速率远低于目标，可能遇到瓶颈
+        if (bw < ca->target_rate / 2 && ca->loss_count > 0) {
+            // 温和降速
+            ca->target_rate = max_t(u64, bw * 15 / 10, lotserver_rate / 4);
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 15);
+            if (lotserver_verbose) {
+                unsigned long gbps_int = ca->target_rate / 125000000;
+                unsigned long gbps_frac = (ca->target_rate % 125000000) * 100 / 125000000;
+                unsigned int gain_int = ca->cwnd_gain / 10;
+                unsigned int gain_frac = ca->cwnd_gain % 10;
+                pr_info("lotspeed: [uk0] adapt DOWN: rate=%lu.%02lu Gbps, gain=%u.%ux\n",
+                        gbps_int, gbps_frac, gain_int, gain_frac);
+            }
+        }
+            // 如果表现良好，逐步恢复
+        else if (bw > ca->target_rate * 8 / 10 && ca->loss_count == 0) {
+            ca->target_rate = min_t(u64, ca->target_rate * 11 / 10, lotserver_rate);
+            ca->cwnd_gain = min_t(u32, ca->cwnd_gain + 2, lotserver_gain);
+        }
+    }
+
+    // RTT 膨胀检测
+    if (ca->rtt_min && tp->srtt_us >> 3 > ca->rtt_min * 3 / 2) {
+        // RTT 膨胀超过 50%，可能有队列堆积
+        if (!lotserver_turbo) {
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+        }
     }
 }
 
-// 通用拥塞控制逻辑
+// 核心拥塞控制逻辑实现（内部函数）
 static void lotspeed_cong_control_impl(struct sock *sk, const struct rate_sample *rs)
 {
     struct tcp_sock *tp = tcp_sk(sk);
     struct lotspeed *ca = inet_csk_ca(sk);
-    u64 rate_bps;
-    u32 cwnd, target_cwnd;
+    u64 rate;
+    u32 cwnd;
     u32 rtt_us = tp->srtt_us >> 3;
     u32 mss = tp->mss_cache;
+    u32 target_cwnd;
 
-    if (!mss) mss = 1460;
-    if (!rtt_us) rtt_us = 1000; // 1ms 兜底
+    // 默认值处理
+    if (!rtt_us) rtt_us = 1000;   // 1ms 默认
+    if (!mss) mss = 1460;          // 标准以太网 MSS
 
-    lotspeed_update_rtt(sk, ca);
-    lotspeed_update_bandwidth(sk, rs);
+    // 更新 RTT 统计
+    lotspeed_update_rtt(sk);
 
-    // 1. 确定目标速率
-    // 如果用户设定了 lotserver_rate (非0)，则取 max(max_bw, user_rate)
-    // 否则完全依赖 BWE 探测
-    rate_bps = ca->max_bw;
-    if (lotserver_rate > 0 && rate_bps < lotserver_rate) {
-        rate_bps = lotserver_rate;
-    }
-    // 防止 rate 为 0
-    if (rate_bps == 0) rate_bps = 12500000; // 100Mbps fallback
+    // 自适应调整
+    lotspeed_adapt_rate(sk, rs);
 
-    // 2. 计算 BDP 目标窗口
-    // Target CWND = (Rate * minRTT) / MSS * Gain
-    // 使用 minRTT 而不是 srtt 可以抵抗 Bufferbloat
-    u64 bdp_bytes = (rate_bps * (u64)ca->rtt_min);
-    do_div(bdp_bytes, USEC_PER_SEC); // Bytes in flight
+    // 选择速率
+    rate = ca->target_rate;
 
-    target_cwnd = div_u64(bdp_bytes, mss); // BDP in packets
-    target_cwnd = (target_cwnd * ca->cwnd_gain) / 10; // 应用增益
+    // 核心公式：CWND = (rate × RTT) / MSS × gain
+    target_cwnd = div64_u64(rate * (u64)rtt_us, (u64)mss * 1000000);
+    target_cwnd = div_u64(target_cwnd * ca->cwnd_gain, 10);
 
-    // 3. 慢启动与窗口调整
-    if (ca->ss_mode) {
-        if (tp->snd_cwnd < target_cwnd) {
-            cwnd = tp->snd_cwnd * 2; // 指数增长
-        } else {
+    // 慢启动阶段特殊处理
+    if (ca->ss_mode && tp->snd_cwnd < tp->snd_ssthresh) {
+        // 指数增长
+        cwnd = tp->snd_cwnd * 2;
+        if (cwnd >= target_cwnd) {
             ca->ss_mode = false;
             cwnd = target_cwnd;
         }
     } else {
+        // 正常阶段
         cwnd = target_cwnd;
-        // 即使在稳定期，也保持微量的探测增长
-        if (!lotserver_turbo) {
-            // 简单的加性增益
-            cwnd += 2;
+
+        // 周期性探测更高速率
+        ca->probe_cnt++;
+        if (ca->probe_cnt >= 100) {  // 每 100 个 RTT 探测一次
+            cwnd = cwnd * 11 / 10;   // 探测 +10%
+            ca->probe_cnt = 0;
         }
     }
 
-    // 4. 边界限制
+    // 应用安全限制
     cwnd = max_t(u32, cwnd, lotserver_min_cwnd);
     cwnd = min_t(u32, cwnd, lotserver_max_cwnd);
-    cwnd = min_t(u32, cwnd, tp->snd_cwnd_clamp); // 遵守系统最大限制
+    cwnd = min_t(u32, cwnd, tp->snd_cwnd_clamp);
 
+    // 设置拥塞窗口和 pacing 速率
     tp->snd_cwnd = cwnd;
 
-    // 5. Pacing 设置 (关键优化)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 13, 0)
-    {
-        // 设置 Pacing 为 125% 的目标速率
-        // 留出 25% 的 Headroom 给 ACK 聚合和突发，防止过度平滑导致吞吐上不去
-        u64 pacing_rate = rate_bps + (rate_bps >> 2);
-        sk->sk_pacing_rate = min_t(u64, pacing_rate, sk->sk_max_pacing_rate);
-    }
+    // 改进: 给予 20% 的 Overhead 空间，防止 Pacing 限制了 TCP 本身的突发能力
+    // 许多网卡需要小规模的突发来维持高吞吐
+    u64 pacing = rate + (rate >> 2); // Rate * 1.25
+    sk->sk_pacing_rate = (rate * 120) / 100;
 #endif
 
-    // 移除所有 pr_info 以保证性能
+    // 定期状态输出
+    if (lotserver_verbose && ca->rtt_cnt > 0 && ca->rtt_cnt % 1000 == 0) {
+        unsigned long gbps_int = rate / 125000000;
+        unsigned long gbps_frac = (rate % 125000000) * 100 / 125000000;
+        unsigned int gain_int = ca->cwnd_gain / 10;
+        unsigned int gain_frac = ca->cwnd_gain % 10;
+
+        pr_info("lotspeed: [uk0] STATUS: cwnd=%u | rate=%lu.%02lu Gbps | RTT=%u us | gain=%u.%ux | losses=%u\n",
+                cwnd, gbps_int, gbps_frac, rtt_us, gain_int, gain_frac, ca->loss_count);
+    }
 }
 
-// 接口适配
+// 主拥塞控制函数 - 兼容不同内核版本
 #ifdef NEW_CONG_CONTROL_API
-static void lotspeed_cong_control(struct sock *sk, u32 ack, int flag, const struct rate_sample *rs) {
+// 新版本内核 (5.19-6.7.x, 6.9+, 6.17+)
+static void lotspeed_cong_control(struct sock *sk, u32 ack, int flag,
+                                  const struct rate_sample *rs)
+{
+    // 新版本可以使用 ack 和 flag 参数进行更精细的控制
+    #ifdef KERNEL_6_17_PLUS
+    // 6.17+ 内核的特殊处理
+    if (flag & CA_ACK_ECE && lotserver_verbose) {
+        pr_debug("lotspeed: [6.17+] ECN echo received, ack=%u\n", ack);
+    }
+    #endif
+
+    // 调用实际的拥塞控制逻辑
     lotspeed_cong_control_impl(sk, rs);
 }
 #else
-static void lotspeed_cong_control(struct sock *sk, const struct rate_sample *rs) {
+// 旧版本内核 (5.18 及以下, 6.8.0-6.8.x)
+static void lotspeed_cong_control(struct sock *sk, const struct rate_sample *rs)
+{
+    // 直接调用实际的拥塞控制逻辑
     lotspeed_cong_control_impl(sk, rs);
 }
 #endif
 
-// 状态与事件处理
+// 处理状态变化
 static void lotspeed_set_state(struct sock *sk, u8 new_state)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
     struct tcp_sock *tp = tcp_sk(sk);
 
-    if (new_state == TCP_CA_Loss) {
-        // Turbo 模式下无视丢包
-        if (lotserver_turbo) {
-            tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
-            return;
-        }
+    switch (new_state) {
+        case TCP_CA_Loss:
+            // 涡轮模式完全无视丢包
+            if (lotserver_turbo) {
+                tp->snd_ssthresh = TCP_INFINITE_SSTHRESH;
+                if (lotserver_verbose && ca->loss_count % 10 == 0) {
+                    pr_info("lotspeed: [uk0] TURBO: Ignoring loss #%u\n", ca->loss_count + 1);
+                }
+                return;
+            }
+            // 记录丢包
+            ca->loss_count++;
+            ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
 
-        ca->loss_count++;
+            if (lotserver_verbose && (ca->loss_count == 1 || ca->loss_count % 10 == 0)) {
+                unsigned int gain_int = ca->cwnd_gain / 10;
+                unsigned int gain_frac = ca->cwnd_gain % 10;
+                pr_info("lotspeed: [uk0] LOSS #%u detected, gain reduced to %u.%ux\n",
+                        ca->loss_count, gain_int, gain_frac);
+            }
+            break;
 
-        // 发生丢包时，稍微降低 max_bw，模拟乘性减小
-        // 降低 20%
-        ca->max_bw = (ca->max_bw * 8) / 10;
+        case TCP_CA_Recovery:
+            // 进入恢复阶段
+            if (!lotserver_turbo) {
+                ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 9 / 10, 15);
+            }
+            break;
 
-        // 重置为最小速率以防万一
-        if (ca->max_bw < 125000) ca->max_bw = 125000; // 1Mbps min
+        case TCP_CA_Open:
+            // 恢复正常
+            ca->ss_mode = false;
+            break;
+
+        default:
+            break;
     }
 }
 
+// 丢包时的 ssthresh
 static u32 lotspeed_ssthresh(struct sock *sk)
 {
-    // Turbo 模式不降速
-    return lotserver_turbo ? TCP_INFINITE_SSTHRESH : tcp_sk(sk)->snd_cwnd;
+    struct lotspeed *ca = inet_csk_ca(sk);
+    struct tcp_sock *tp = tcp_sk(sk);
+
+    // 涡轮模式：永不降速
+    if (lotserver_turbo) {
+        return TCP_INFINITE_SSTHRESH;
+    }
+
+    // 温和降速
+    ca->loss_count++;
+    ca->cwnd_gain = max_t(u32, ca->cwnd_gain * 8 / 10, 10);
+
+    return max_t(u32, tp->snd_cwnd * 7 / 10, lotserver_min_cwnd);
 }
 
+// 恢复拥塞窗口
 static u32 lotspeed_undo_cwnd(struct sock *sk)
 {
-    return tcp_sk(sk)->snd_cwnd;
+    struct tcp_sock *tp = tcp_sk(sk);
+    struct lotspeed *ca = inet_csk_ca(sk);
+
+    // 误判恢复，重置丢包计数
+    ca->loss_count = 0;
+    ca->ss_mode = false;
+
+    return max(tp->snd_cwnd, tp->prior_cwnd);
 }
 
+// 处理拥塞事件
 static void lotspeed_cwnd_event(struct sock *sk, enum tcp_ca_event event)
 {
     struct lotspeed *ca = inet_csk_ca(sk);
+
     switch (event) {
-        case CA_EVENT_TX_START:
-        case CA_EVENT_CWND_RESTART:
-            ca->ss_mode = true;
+        case CA_EVENT_LOSS:
+            // 发生丢包
+            ca->loss_count++;
+            if (!lotserver_turbo) {
+                ca->cwnd_gain = max_t(u32, ca->cwnd_gain - 5, 10);
+            }
             break;
+
+        case CA_EVENT_TX_START:
+            // 开始传输
+            ca->ss_mode = true;
+            ca->probe_cnt = 0;
+            break;
+
+        case CA_EVENT_CWND_RESTART:
+            // 重新开始
+            ca->ss_mode = true;
+            ca->loss_count = 0;
+            ca->probe_cnt = 0;
+            break;
+
         default:
+            // 其他事件忽略
             break;
     }
 }
@@ -332,43 +574,128 @@ static struct tcp_congestion_ops lotspeed_ops __read_mostly = {
         .flags          = TCP_CONG_NON_RESTRICTED,
 };
 
-// ============================================================
-// 模块初始化与退出
-// ============================================================
+// 辅助函数来格式化带边框的行
+static void print_boxed_line(const char *prefix, const char *content)
+{
+    int prefix_len = strlen(prefix);
+    int content_len = strlen(content);
+    int total_len = prefix_len + content_len;
+    int padding = 56 - total_len;  // 56 = 60 - 2个边框字符
+
+    if (padding < 0) padding = 0;
+
+    pr_info("║%s%s%*s║\n", prefix, content, padding, "");
+}
+
 static int __init lotspeed_module_init(void)
 {
-    pr_info("lotspeed: v3.0 Optimized Init. Rate: %s, Gain: %u.%ux, Turbo: %s\n",
-            lotserver_rate == 0 ? "AUTO" : "STATIC",
-            lotserver_gain/10, lotserver_gain%10,
-            lotserver_turbo ? "ON" : "OFF");
+    unsigned long gbps_int, gbps_frac;
+    unsigned int gain_int, gain_frac;
+    char buffer[128];
+
+    BUILD_BUG_ON(sizeof(struct lotspeed) > ICSK_CA_PRIV_SIZE);
+
+    pr_info("╔════════════════════════════════════════════════════════╗\n");
+    pr_info("║          LotSpeed v2.0 - 锐速复活版                    ║\n");
+
+    // 动态生成时间和用户行
+    snprintf(buffer, sizeof(buffer), "uk0 @ 2025-11-19 17:06:58");
+    print_boxed_line("          Created by ", buffer);
+
+    // 动态生成内核版本行
+    snprintf(buffer, sizeof(buffer), "%u.%u.%u",
+             LINUX_VERSION_CODE >> 16,
+             (LINUX_VERSION_CODE >> 8) & 0xff,
+             LINUX_VERSION_CODE & 0xff);
+    print_boxed_line("          Kernel: ", buffer);
+
+    // 显示API版本信息
+#ifdef KERNEL_6_17_PLUS
+    pr_info("║          API: NEW (6.17+ special)                      ║\n");
+#elif defined(NEW_CONG_CONTROL_API)
+    pr_info("║          API: NEW (5.19-6.7.x, 6.9+)                   ║\n");
+#elif defined(OLD_CONG_CONTROL_API)
+    pr_info("║          API: LEGACY (6.8.0-6.8.x and older)           ║\n");
+#else
+    pr_info("║          API: LEGACY (<5.19)                           ║\n");
+#endif
+
+    pr_info("╚════════════════════════════════════════════════════════╝\n");
+
+    gbps_int = lotserver_rate / 125000000;
+    gbps_frac = (lotserver_rate % 125000000) * 100 / 125000000;
+    gain_int = lotserver_gain / 10;
+    gain_frac = lotserver_gain % 10;
+
+    pr_info("Initial Parameters:\n");
+    pr_info("  Rate: %lu.%02lu Gbps\n", gbps_int, gbps_frac);
+    pr_info("  Gain: %u.%ux\n", gain_int, gain_frac);
+    pr_info("  Min/Max CWND: %u/%u\n", lotserver_min_cwnd, lotserver_max_cwnd);
+    pr_info("  Adaptive: %s | Turbo: %s | Verbose: %s\n",
+            lotserver_adaptive ? "ON" : "OFF",
+            lotserver_turbo ? "ON" : "OFF",
+            lotserver_verbose ? "ON" : "OFF");
+
     return tcp_register_congestion_control(&lotspeed_ops);
 }
 
 static void __exit lotspeed_module_exit(void)
 {
-    int retries = 0;
+    u64 total_bytes;
+    u64 gb_sent, mb_sent;
+    int active_conns;
+    int retry_count = 0;
+
+    pr_info("lotspeed: [uk0@2025-11-19 17:06:58] Beginning module unload\n");
+
+    // 先注销算法，防止新连接使用
     tcp_unregister_congestion_control(&lotspeed_ops);
+    pr_info("lotspeed: Unregistered from TCP stack\n");
 
-    while (atomic_read(&active_connections) > 0 && retries < 20) {
-        msleep(100);
-        retries++;
+    // 等待现有连接释放（最多等待5秒）
+    while (atomic_read(&active_connections) > 0 && retry_count < 50) {
+        pr_info("lotspeed: Waiting for %d connections to close (attempt %d/50)\n",
+                atomic_read(&active_connections), retry_count + 1);
+        msleep(100);  // 等待100ms
+        retry_count++;
     }
 
-    if (atomic_read(&active_connections) > 0 && !force_unload) {
-        pr_err("lotspeed: Busy. Use force_unload=1 to kill.\n");
-        // Re-register to avoid crash
-        tcp_register_congestion_control(&lotspeed_ops);
-        return;
+    active_conns = atomic_read(&active_connections);
+
+    if (active_conns > 0) {
+        pr_err("lotspeed: WARNING - Force unloading with %d active connections!\n", active_conns);
+        pr_err("lotspeed: This may cause system instability!\n");
+
+        if (!force_unload) {
+            pr_err("lotspeed: Refusing to unload. Set force_unload=1 to override\n");
+            pr_err("lotspeed: echo 1 > /sys/module/lotspeed/parameters/force_unload\n");
+
+            // 重新注册以保持稳定
+            tcp_register_congestion_control(&lotspeed_ops);
+            return;  // 拒绝卸载
+        }
     }
 
-    u64 total = atomic64_read(&total_bytes_sent);
-    pr_info("lotspeed: Unloaded. Total Sent: %llu MB.\n", total >> 20);
+    total_bytes = atomic64_read(&total_bytes_sent);
+    gb_sent = total_bytes >> 30;
+    mb_sent = (total_bytes >> 20) & 0x3FF;
+
+    pr_info("╔════════════════════════════════════════════════════════╗\n");
+    pr_info("║          LotSpeed v2.0 Unloaded                        ║\n");
+    pr_info("║          Time: 2025-11-19 17:06:58                     ║\n");
+    pr_info("║          User: uk0                                     ║\n");
+    pr_info("║          Active Connections: %-26d║\n", active_conns);
+    pr_info("║          Data Sent: %llu.%llu GB%*s║\n",
+            gb_sent, mb_sent * 1000 / 1024,
+            (int)(30 - snprintf(NULL, 0, "%llu.%llu GB", gb_sent, mb_sent * 1000 / 1024)), "");
+    pr_info("╚════════════════════════════════════════════════════════╝\n");
 }
 
 module_init(lotspeed_module_init);
 module_exit(lotspeed_module_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("uk0 (Optimized)");
-MODULE_VERSION("3.0");
-MODULE_DESCRIPTION("High-Performance TCP Congestion Control");
+MODULE_AUTHOR("uk0 <github.com/uk0>");
+MODULE_VERSION("2.0");
+MODULE_DESCRIPTION("LotSpeed v2.0 - Modern LotServer/ServerSpeeder replacement for 1G~40G networks");
+MODULE_ALIAS("tcp_lotspeed");
